@@ -1,0 +1,49 @@
+name: macos-appleid10-captcha
+on:
+  workflow_dispatch:
+jobs:
+  safari10:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      APPLE_CC: 'GB'
+      APPLE_NAT: '7450699185'
+      APPLE_INBOX: 'https://asms.ai/number/447450699185'
+    steps:
+      - uses: actions/checkout@v4
+      - name: env probe
+        run: |
+          sw_vers; uname -m; sysctl -n hw.model || true; sysctl -n kern.hv_vmm_present || true
+          python3 -V; safaridriver --version || true
+      - name: build captcha OCR helper (Vision)
+        run: |
+          swiftc -O ocr10.swift -o /tmp/ocr10 && ls -l /tmp/ocr10 || echo OCR10_BUILD_FAILED
+      - name: install tesseract (3rd OCR engine, optional)
+        run: |
+          brew install tesseract >/tmp/brew_tess.log 2>&1 || echo BREW_TESS_FAILED
+          which tesseract && tesseract --version | head -2 || true
+      - name: enable and start safaridriver (headful GUI session)
+        run: |
+          sudo -n safaridriver --enable || echo "ENABLE_FAILED"
+          defaults write com.apple.Safari AllowJavaScriptFromAppleEvents -bool true || true
+          nohup safaridriver --port 4444 > "$RUNNER_TEMP/safaridriver.log" 2>&1 &
+          sleep 3
+          curl -s -m 8 http://127.0.0.1:4444/status || echo "STATUS_FAILED"
+      - name: apple signup with captcha-original-bytes + multi-engine consensus
+        run: |
+          cd "$GITHUB_WORKSPACE"; ls -la
+          python3 apple_wd10.py 2>&1 || true
+      - name: redact credentials before upload
+        if: always()
+        run: |
+          python3 redact10.py 2>&1 || true
+          python3 -c "import json;d=json.load(open('out10/summary10.json'));print('STAGE=',d.get('stage'));print('EVENTS=',len(d.get('events',[])))" 2>/dev/null || true
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appleid-evidence10
+          path: |
+            out10
+            ${{ runner.temp }}/safaridriver.log
+          if-no-files-found: warn
