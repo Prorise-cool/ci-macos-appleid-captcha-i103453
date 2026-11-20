@@ -27,6 +27,7 @@ n = 0
 for f in glob.glob(os.path.join(OUT, '**', '*'), recursive=True):
     if not os.path.isfile(f): continue
     if f.endswith(('.png', '.jpg', '.jpeg')): continue
+    if os.path.basename(f) == 'cred.txt': continue   # credential handoff file, deleted with the artifact
     try:
         s = open(f, encoding='utf-8', errors='replace').read()
     except Exception:
