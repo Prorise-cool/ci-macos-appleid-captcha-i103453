@@ -553,6 +553,15 @@ def main():
     email = chosen['addr']; pw = STATE['password'] = 'Aa1!' + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(13))
     print('::add-mask::' + pw); print('::add-mask::' + email)
     STATE['email_addr'] = email
+    # credential handoff: kept OUT of the graph, lives only in this runner file (600) until the
+    # artifact is fetched and deleted; redact10.py deliberately leaves cred.txt untouched.
+    try:
+        cp = os.path.join(OUT, 'cred.txt')
+        with open(cp, 'w') as f: f.write('email=%s\npassword=%s\nphone=+44%s\n' % (email, pw, NUM_NAT))
+        os.chmod(cp, 0o600)
+        ev('cred_file_written', {'path': 'out10/cred.txt'})
+    except Exception as e:
+        ev('cred_file_err', repr(e)[:120])
     for nm, v in (('firstName', 'Alex'), ('lastName', 'Miller')): set_input(nm, v)
     ev('month_set', set_tid('select-month', '04'))
     ev('day_set', set_tid('select-day', '09'))
