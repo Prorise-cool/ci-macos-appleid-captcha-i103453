@@ -361,6 +361,38 @@ def run_tesseract(p):
     ordered = [x for x, _ in cnt.most_common()] + [x.upper() for x in outs]
     return {'outs': outs, 'ordered': ordered}
 
+def tess_variants(p):
+    """extra independent tesseract passes on preprocessed (upscaled / median / threshold) copies"""
+    outs = []
+    try:
+        from PIL import Image, ImageFilter
+    except Exception:
+        ev('tess_variants_no_pil', True); return outs
+    try:
+        im0 = Image.open(p).convert('L')
+        vs = []
+        for s in (2, 3, 4):
+            im = im0.resize((im0.width * s, im0.height * s), Image.LANCZOS)
+            vs.append(im.filter(ImageFilter.MedianFilter(3)))
+            vs.append(im.point(lambda q: 0 if q < 140 else 255))
+            vs.append(im.point(lambda q: 0 if q < 110 else 255))
+        for k, im in enumerate(vs):
+            fp = '/tmp/tv%d.png' % k
+            try: im.save(fp)
+            except Exception: continue
+            for psm in ('7', '6'):
+                try:
+                    r = subprocess.run(['tesseract', fp, 'stdout', '--psm', psm, '-c',
+                                        'tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'],
+                                       capture_output=True, text=True, timeout=45)
+                    t = ''.join(ch for ch in (r.stdout or '') if ch.isalnum())
+                    if t: outs.append(t)
+                except Exception:
+                    pass
+    except Exception as e:
+        ev('tess_variants_err', repr(e)[:150])
+    return outs
+
 def perchar_ratio(perchar_str, top):
     """mean over positions of (top char share among the top-3 per position)"""
     if not perchar_str: return 0.0
@@ -386,41 +418,40 @@ def perchar_ratio(perchar_str, top):
     return tot / len(pos)
 
 def decide(ocr, tess, n):
-    """return (guess|None, diagnostics)"""
+    """v11: weighted candidate fusion (Vision + tesseract majority + length prior).
+    Always returns the best candidate; the caller submits at most 3 answers total."""
     diag = {}
-    if not ocr.get('cands'):
-        diag['reason'] = 'no_vision_candidates'; return None, diag
-    cands = [(s, sc) for (s, sc) in ocr['cands'] if 4 <= len(s) <= 6]
-    if not cands:
-        diag['reason'] = 'candidate_length_not_4_6'; return None, diag
-    top, score = cands[0]
-    total = sum(sc for _, sc in ocr['cands']) or 1.0
-    ratio = score / total
-    pri = perchar_ratio((ocr.get('perchar_by_len') or {}).get(len(top), ''), top)
-    diag.update({'top': top, 'score': round(score, 2), 'vote_ratio': round(ratio, 3), 'perchar_ratio': round(pri, 3),
-                 'cands': [c[0] for c in cands[:6]], 'slvotes': ocr.get('slvotes', ''),
-                 'tess': (tess or {}).get('outs', [])})
-    tl = [t.upper() for t in (tess or {}).get('outs', [])]
-    agree_tess = (top.upper() in tl)
-    agree_slice = (ocr.get('slvotes', '').upper() == top.upper()) if ocr.get('slvotes') else False
-    # per-position agreement with the most common tesseract read
-    char_agree = 0.0
-    if tl:
-        tc = (tess.get('ordered') or tl)[0]
-        if len(tc) == len(top):
-            char_agree = sum(1 for a, b in zip(top.upper(), tc) if a == b) / len(top)
-    diag.update({'agree_tess': agree_tess, 'agree_slice': agree_slice, 'char_agree': round(char_agree, 2)})
-    strong = (ratio >= 0.26 and pri >= 0.50)
-    if tl:
-        confident = (agree_tess and strong) or (strong and char_agree >= 0.75 and len(top) == 4) \
-                    or (strong and agree_slice and char_agree >= 0.75)
-    else:
-        # tesseract unavailable -> need stronger internal evidence
-        confident = (strong and agree_slice) or (ratio >= 0.45 and pri >= 0.70)
-    if confident:
-        return top, diag
-    diag['reason'] = 'below_threshold'
-    return None, diag
+    vs = [(s, sc) for (s, sc) in (ocr.get('cands') or []) if 3 <= len(s) <= 6]
+    ts = [t for t in ((tess or {}).get('outs') or []) if 4 <= len(t) <= 6]
+    score = {}
+    srcs = {}
+    for s, sc in vs:
+        k = s.upper()
+        score[k] = score.get(k, 0.0) + 2.0 * float(sc)
+        srcs.setdefault(k, set()).add('vision')
+    for t in ts:
+        k = t.upper()
+        score[k] = score.get(k, 0.0) + 4.0
+        srcs.setdefault(k, set()).add('tess')
+    # cross-engine partial agreement bonus (same length, >=len-1 chars equal)
+    for s, _sc in vs:
+        for t in ts:
+            if len(s) == len(t) and sum(1 for a, b in zip(s.upper(), t.upper()) if a == b) >= max(2, len(s) - 1):
+                k = s.upper(); score[k] = score.get(k, 0.0) + 1.5
+                srcs.setdefault(k, set()).update(('vision', 'tess'))
+    # length prior: captchas here are 4-5 chars; 3-char singleton tesseract reads are usually truncations
+    for k in list(score):
+        if len(k) == 4: score[k] += 1.0
+        elif len(k) == 5: score[k] += 0.5
+        elif len(k) == 3: score[k] -= 1.5
+    if not score:
+        diag['reason'] = 'no_candidates'; return None, diag
+    ranking = sorted(score.items(), key=lambda kv: -kv[1])
+    top = ranking[0][0]
+    diag.update({'top': top, 'ranking': [(k, round(v, 2)) for k, v in ranking[:6]],
+                 'src': sorted(srcs.get(top, [])), 'tess': ts,
+                 'vision': [c[0] for c in vs[:6]], 'reason': 'scored'})
+    return top, diag
 
 def main():
     global SID
@@ -536,58 +567,73 @@ def main():
     ev('invalid_after_fill', invalid_fields())
     dump('13_filled')
 
-    # ---------- captcha: <=6 images / <=3 submissions ----------
+    # ---------- captcha v11: <=6 images / <=3 submissions, New Code never clicked ----------
     ok_submit = False
     images = 0
     submissions = 0
-    used_guesses = set()
+    used = set()
+    last_sha = None
     while images < 6 and submissions < 3 and time_left() > 700:
         cb = captcha_bytes()
         if not cb:
             ev('no_captcha', {'images': images}); time.sleep(3); images += 1; continue
+        if last_sha and cb['sha'] == last_sha:
+            rotated = False
+            for _ in range(10):
+                time.sleep(2)
+                cbn = captcha_bytes()
+                if cbn and cbn['sha'] != last_sha:
+                    cb = cbn; rotated = True; break
+            ev('captcha_rotate_wait', {'rotated': rotated, 'sha': cb['sha']})
+            if not rotated:
+                ev('captcha_stale_after_submit', {'sha': cb['sha']}); break
         images += 1
         p = os.path.join(OUT, 'captcha_%d.jpg' % images)
         open(p, 'wb').write(cb['raw'])
         ocr = run_ocr10(p)
         tess = run_tesseract(p)
+        try:
+            tv = tess_variants(p)
+            if tv:
+                tess['outs'] = (tess.get('outs') or []) + tv
+                from collections import Counter
+                cnt = Counter(x.upper() for x in tess['outs'])
+                tess['ordered'] = [x for x, _ in cnt.most_common()]
+                ev('tess_variants', {'n': len(tv), 'top': tess['ordered'][:4]})
+        except Exception as e:
+            ev('tess_variants_fail', repr(e)[:120])
         guess, diag = decide(ocr, tess, images)
+        if guess and guess in used:
+            alt = [k for k, _v in diag.get('ranking', []) if k not in used]
+            if alt:
+                diag['pick'] = guess; guess = alt[0]; diag['reason'] = 'repeat_avoided'
         ev('captcha_image', {'n': images, 'sha': cb['sha'], 'w': cb['w'], 'h': cb['h'], 'bytes': len(cb['raw']),
-                             'src_kind': cb['src_kind'], 'ocr_raw': (ocr.get('raw') or '')[-900:],
+                             'src_kind': cb['src_kind'], 'ocr_raw': (ocr.get('raw') or '')[-700:],
                              'tess': (tess or {}).get('outs', []), 'decision': diag, 'guess': guess})
-        if guess and guess.upper() in used_guesses:
-            ev('captcha_repeat_guess_skip', {'n': images, 'guess': guess})
-            guess = None
-            diag['reason'] = 'repeat_guess'
-        if not guess and images >= 5 and submissions == 0:
-            weak = [c for c in (ocr.get('cands') or []) if 4 <= len(c[0]) <= 6]
-            if weak and weak[0][0].upper() not in used_guesses:
-                guess = weak[0][0]; diag['reason'] = 'last_resort_weak'
-                ev('captcha_last_resort', {'n': images, 'guess': guess, 'ratio': weak[0][1]})
         if not guess:
-            if not new_code(): ev('new_code_failed', {'n': images})
-            time.sleep(3)
-            continue
-        # make sure the image we OCR'd is still the one on screen
+            ev('captcha_no_guess', {'n': images}); break
         cb2 = captcha_bytes()
         if not cb2 or cb2['sha'] != cb['sha']:
-            ev('captcha_rotated_before_submit', {'n': images, 'now': (cb2 or {}).get('sha')})
-            continue
+            ev('captcha_rotated_before_submit', {'n': images, 'now': (cb2 or {}).get('sha')}); continue
         el = find('input[name="captcha"]')
-        if el:
-            try:
-                click(el)
-                js("var e=document.querySelector('input[name=captcha]'); if(e){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));}")
-                keys(el, guess)
-            except Exception as e: ev('captcha_fill_err', repr(e)[:120])
+        if not el:
+            ev('captcha_input_missing', {'n': images}); break
+        try:
+            click(el)
+            js("var e=document.querySelector('input[name=captcha]'); if(e){e.value='';e.dispatchEvent(new Event('input',{bubbles:true}));}")
+            keys(el, guess)
+            js("var e=document.querySelector('input[name=captcha]'); if(e){e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));}")
+        except Exception as e:
+            ev('captcha_fill_err', repr(e)[:120])
         filled = js("var e=document.querySelector('input[name=captcha]'); return e?e.value:null;")
         ev('captcha_filled', {'n': images, 'guess': guess, 'field': filled})
         if (filled or '') != guess:
-            ev('captcha_fill_mismatch', {'n': images}); continue
-        used_guesses.add(guess.upper())
+            ev('captcha_fill_mismatch', {'n': images, 'field': filled}); continue
+        used.add(guess); last_sha = cb['sha']
         btn = find_xp('//button[@type="submit"]')
         if btn: click(btn)
         submissions += 1
-        time.sleep(10); t = dump('%02d_after_submit_%d' % (20 + images, images)); low = t.lower()
+        time.sleep(8); t = dump('%02d_after_submit_%d' % (20 + images, images)); low = t.lower()
         if is_vm_block(t):
             ev('vm_block_detected', t[:500]); STATE['stage'] = 'vm_blocked'; save(); return
         errs = js("""return Array.from(document.querySelectorAll('[class*=error],[role=alert],.form-message')).map(function(e){return e.innerText.trim().slice(0,400);}).filter(Boolean).slice(0,8);""")
@@ -605,8 +651,6 @@ def main():
             save(); dump('26_page_refused'); return
         if email_bad:
             STATE['stage'] = 'email_rejected_after_submit'; save(); dump('25_email_rejected'); return
-        if not new_code(): ev('new_code_failed', {'n': images})
-        time.sleep(3)
     ev('captcha_summary', {'images': images, 'submissions': submissions, 'passed': ok_submit})
     if not ok_submit:
         STATE['stage'] = 'captcha_not_passed'; save(); return
