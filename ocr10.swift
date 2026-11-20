@@ -50,7 +50,7 @@ var variants: [(String, CIImage)] = [("orig", src), ("g2", g2), ("gi2", inv(g2))
                                      ("g35", g35), ("gi35", inv(g35)),
                                      ("sharp", sharpen(g2, 1.0)), ("sharpi", inv(sharpen(g2, 1.0)))]
 var votes: [String: Double] = [:]
-var perchar: [Int: [Character: Double]] = [:]
+var perchar: [Int: [Int: [Character: Double]]] = [:]   // candidate length -> position -> char -> score
 var nobs = 0
 for (name, v) in variants {
     for scale in [4.0, 7.0] as [CGFloat] {
@@ -62,7 +62,7 @@ for (name, v) in variants {
             if s.count >= 3 && s.count <= 6 {
                 let chars = Array(s)
                 if chars.count == 4 || chars.count == 5 {
-                    for i in 0..<chars.count { perchar[i, default: [:]][chars[i], default: 0] += Double(conf) }
+                    for i in 0..<chars.count { perchar[chars.count, default: [:]][i, default: [:]][chars[i], default: 0] += Double(conf) }
                 }
             }
         }
@@ -71,12 +71,14 @@ for (name, v) in variants {
 let ranked = votes.sorted { $0.value > $1.value }
 print("NOBS:\(nobs)")
 print("CANDS:" + ranked.prefix(6).map { "\($0.key)|\(String(format: "%.2f", $0.value))" }.joined(separator: ","))
-var pcOut: [String] = []
-for i in perchar.keys.sorted() {
-    let m = perchar[i]!.sorted { $0.value > $1.value }
-    pcOut.append("p\(i+1)=" + m.prefix(3).map { "\($0.key):\(String(format: "%.1f", $0.value))" }.joined(separator: "/"))
+for L in perchar.keys.sorted() {
+    var pcOut: [String] = []
+    for i in perchar[L]!.keys.sorted() {
+        let m = perchar[L]![i]!.sorted { $0.value > $1.value }
+        pcOut.append("p\(i+1)=" + m.prefix(3).map { "\($0.key):\(String(format: "%.1f", $0.value))" }.joined(separator: "/"))
+    }
+    print("PERCHAR\(L):" + pcOut.joined(separator: ";"))
 }
-print("PERCHAR:" + pcOut.joined(separator: ";"))
 print("BEST:" + (ranked.first?.key ?? ""))
 
 // ---------- engine B: per-character slices ----------
