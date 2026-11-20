@@ -18,9 +18,11 @@ jobs:
       - name: build captcha OCR helper (Vision)
         run: |
           swiftc -O ocr10.swift -o /tmp/ocr10 && ls -l /tmp/ocr10 || echo OCR10_BUILD_FAILED
-      - name: install tesseract (3rd OCR engine, optional)
+      - name: install tesseract + pillow (3rd/4th OCR passes, optional)
         run: |
           brew install tesseract >/tmp/brew_tess.log 2>&1 || echo BREW_TESS_FAILED
+          python3 -m pip install --quiet pillow 2>/tmp/pip_pillow.log || echo PIP_PILLOW_FAILED
+          python3 -c "import PIL;print('PIL',PIL.__version__)" || true
           which tesseract && tesseract --version | head -2 || true
           { ls -l /tmp/ocr10; file /tmp/ocr10; } > "$GITHUB_WORKSPACE/build_ocr10.txt" 2>&1 || true
           cat "$GITHUB_WORKSPACE/build_ocr10.txt" 
