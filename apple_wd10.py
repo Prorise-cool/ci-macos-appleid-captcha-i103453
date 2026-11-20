@@ -326,7 +326,7 @@ def run_ocr10(p):
     except Exception as e:
         return {'err': repr(e)[:150]}
     lines = out.splitlines()
-    d = {'raw': out[-2500:], 'cands': [], 'perchar': {}, 'slvotes': '', 'nobs': 0}
+    d = {'raw': out[-2500:], 'cands': [], 'perchar_by_len': {}, 'slvotes': '', 'nobs': 0}
     for ln in lines:
         if ln.startswith('NOBS:'):
             try: d['nobs'] = int(ln[5:])
@@ -337,8 +337,9 @@ def run_ocr10(p):
                     s, sc = item.rsplit('|', 1)
                     try: d['cands'].append((s, float(sc)))
                     except Exception: pass
-        elif ln.startswith('PERCHAR:'):
-            d['perchar'] = ln[8:]
+        elif ln.startswith('PERCHAR'):
+            m = re.match(r'PERCHAR(\d):(.*)', ln)
+            if m: d['perchar_by_len'][int(m.group(1))] = m.group(2)
         elif ln.startswith('SLVOTES:'):
             d['slvotes'] = ln[8:].strip()
     return d
@@ -395,7 +396,7 @@ def decide(ocr, tess, n):
     top, score = cands[0]
     total = sum(sc for _, sc in ocr['cands']) or 1.0
     ratio = score / total
-    pri = perchar_ratio(ocr.get('perchar'), top)
+    pri = perchar_ratio((ocr.get('perchar_by_len') or {}).get(len(top), ''), top)
     diag.update({'top': top, 'score': round(score, 2), 'vote_ratio': round(ratio, 3), 'perchar_ratio': round(pri, 3),
                  'cands': [c[0] for c in cands[:6]], 'slvotes': ocr.get('slvotes', ''),
                  'tess': (tess or {}).get('outs', [])})
@@ -478,21 +479,45 @@ def main():
     ev('frame_url', js("return location.href;"))
     verdicts = {}
     for c in CANDS:
-        verdicts[c['addr']] = server_validate(c['addr'])
+        try: verdicts[c['addr']] = server_validate(c['addr'])
+        except Exception as ex: verdicts[c['addr']] = {'err': repr(ex)[:150]}
         ev('srv_validate', {'kind': c['kind'], 'r': verdicts[c['addr']]})
 
     def srv_valid(addr):
         r = verdicts.get(addr) or {}
+        if (r.get('status') or 0) != 200: return None
         try: return json.loads(r.get('body') or '{}')
         except Exception: return None
 
+    def dom_probe(addr):
+        set_email(addr)
+        f2 = find('input[name="firstName"]')
+        if f2:
+            try: click(f2)
+            except Exception: pass
+        time.sleep(3)
+        return js("""var e=document.querySelector('input[name=appleId]'); if(!e) return {gone:true};
+          return {v:e.value, inv:(e.getAttribute('aria-invalid')||''),
+                  hasInvalidText:((document.body.innerText)||'').indexOf('Enter a valid email address')>=0};""")
+
     chosen = None
+    oracle_ok = False
     for c in CANDS:
         j = srv_valid(c['addr'])
         if j and j.get('valid') is True and not j.get('isRecycledDomain'):
-            chosen = c; break
+            oracle_ok = True; chosen = c
+            ev('email_chosen_server_oracle', {'kind': c['kind'], 'addr': c['addr']}); break
+    if not oracle_ok:
+        ev('server_oracle_unusable', {'verdicts': [{'kind': c['kind'], 'r': verdicts.get(c['addr'])} for c in CANDS]})
     if not chosen:
-        STATE['stage'] = 'temp_domains_rejected_server_side'; save(); dump('20_srv_validate'); return
+        for c in CANDS:
+            r = dom_probe(c['addr'])
+            ev('email_dom_probe', {'kind': c['kind'], 'r': r})
+            if isinstance(r, dict) and not r.get('gone') and not r.get('inv') and not r.get('hasInvalidText') and r.get('v') == c['addr']:
+                chosen = c; ev('email_chosen_dom_probe', {'kind': c['kind']}); break
+    if not chosen:
+        chosen = CANDS[0]
+        ev('email_chosen_last_resort', {'kind': chosen['kind']})
     ev('email_chosen', {'kind': chosen['kind'], 'addr': chosen['addr']})
     email = chosen['addr']; pw = STATE['password'] = 'Aa1!' + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(13))
     print('::add-mask::' + pw); print('::add-mask::' + email)
@@ -533,6 +558,11 @@ def main():
             ev('captcha_repeat_guess_skip', {'n': images, 'guess': guess})
             guess = None
             diag['reason'] = 'repeat_guess'
+        if not guess and images >= 5 and submissions == 0:
+            weak = [c for c in (ocr.get('cands') or []) if 4 <= len(c[0]) <= 6]
+            if weak and weak[0][0].upper() not in used_guesses:
+                guess = weak[0][0]; diag['reason'] = 'last_resort_weak'
+                ev('captcha_last_resort', {'n': images, 'guess': guess, 'ratio': weak[0][1]})
         if not guess:
             if not new_code(): ev('new_code_failed', {'n': images})
             time.sleep(3)
